@@ -99,13 +99,14 @@ jobs:
             -o /tmp/llama.zip \
             || { echo "ERROR: failed to download ${DOWNLOAD_URL}"; exit 1; }
           unzip -q /tmp/llama.zip -d /tmp/llama-extract
-          # Binary lives at build/bin/llama-server inside the zip
-          cp /tmp/llama-extract/build/bin/llama-server /tmp/llama-bin/llama-server
+          # Copy whole bin/ — llama-server depends on libllama.so + libggml*.so
+          cp -r /tmp/llama-extract/build/bin/. /tmp/llama-bin/
           chmod +x /tmp/llama-bin/llama-server
           rm -rf /tmp/llama.zip /tmp/llama-extract
 
       - name: Verify llama-server binary
         run: |
+          export LD_LIBRARY_PATH="/tmp/llama-bin:${LD_LIBRARY_PATH:-}"
           /tmp/llama-bin/llama-server --version 2>&1 || true
           echo "llama-server binary OK at /tmp/llama-bin/llama-server"
 
@@ -152,6 +153,7 @@ jobs:
       - name: Start llama-server
         run: |
           set -euo pipefail
+          export LD_LIBRARY_PATH="/tmp/llama-bin:${LD_LIBRARY_PATH:-}"
           /tmp/llama-bin/llama-server \
             --model "/tmp/models/${MODEL_FILE}" \
             --mmproj "/tmp/models/${MMPROJ_FILE}" \
