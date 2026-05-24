@@ -4,6 +4,22 @@ All notable changes documented here. Format based on [Keep a Changelog](https://
 
 ## [Unreleased] - ReleaseDate
 
+## [0.1.0](https://github.com/AndVl1/vision-analyze/releases/tag/v0.1.0) - 2026-05-24
+
+### Added
+
+- initial vision-analyze implementation
+
+### Fixed
+
+- address Phase 6.5 concurrency regressions (I1+I2)
+- address Phase 6 review findings (critical+high+security)
+
+### Other
+
+- ignore .claude local cache
+- ignore .local/ handoff transcripts
+
 ### Added
 - Initial CLI scaffolding (`vision-analyze <image> <prompt>`)
 - Cold + warm (unix-socket daemon) modes with auto-fallback
