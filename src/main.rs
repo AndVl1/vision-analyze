@@ -13,6 +13,9 @@ use vision_analyze::output;
 use vision_analyze::presets::PresetStore;
 use vision_analyze::socket::{SocketRequest, SocketResponse};
 
+/// Maximum image file size accepted from disk (32 MiB).
+const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
 fn main() {
     let code = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -119,12 +122,24 @@ async fn inference(args: &Args, cfg: &EffectiveConfig) -> Result<i32> {
         .and_then(|p| p.output_format())
         .unwrap_or(cfg.format);
 
+    // C4: check image size before reading to avoid large allocations.
+    let meta = tokio::fs::metadata(image_path).await?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(VisionError::ImageTooLarge(meta.len(), MAX_IMAGE_BYTES));
+    }
     let image = tokio::fs::read(image_path).await?;
 
     let two_images_needed = preset.as_ref().map(|p| p.two_images).unwrap_or(false);
 
     let image_b: Option<Vec<u8>> = match &args.image_b {
-        Some(path) => Some(tokio::fs::read(path).await?),
+        Some(path) => {
+            // C4: apply same size limit to the second image.
+            let meta_b = tokio::fs::metadata(path).await?;
+            if meta_b.len() > MAX_IMAGE_BYTES {
+                return Err(VisionError::ImageTooLarge(meta_b.len(), MAX_IMAGE_BYTES));
+            }
+            Some(tokio::fs::read(path).await?)
+        }
         None => None,
     };
 

@@ -9,6 +9,12 @@ use serde_json::Value;
 use crate::client::{encode_b64, InferenceRequest, InferenceResponse};
 use crate::error::{Result, VisionError};
 
+/// Maximum allowed HTTP response body size (16 MiB).
+///
+/// S4: prevents a malicious or misbehaving server from allocating unbounded
+/// memory via a huge response body.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ServerClient {
     base_url: String,
@@ -163,10 +169,10 @@ impl ServerClient {
             .map_err(|e| VisionError::Analysis(format!("server request: {e}")))?;
 
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| VisionError::Analysis(format!("server read body: {e}")))?;
+        // S4: stream the body with an explicit byte cap to prevent memory exhaustion
+        // from malicious / misbehaving servers.  reqwest has no built-in max-body
+        // option, so we accumulate chunks manually.
+        let text = read_body_capped(resp, MAX_RESPONSE_BYTES).await?;
 
         if !status.is_success() {
             // Try to extract `error.message` from OpenAI-style error body.
@@ -204,6 +210,44 @@ impl ServerClient {
             model: parsed.model.unwrap_or_else(|| "unknown".into()),
         })
     }
+}
+
+/// Read the full response body, returning an error if it exceeds `max_bytes`.
+///
+/// Uses `chunk()` streaming so we never hold more than one chunk + `max_bytes`
+/// of data in memory at once.
+async fn read_body_capped(resp: reqwest::Response, max_bytes: usize) -> Result<String> {
+    // Fast path: if Content-Length is present and already exceeds the limit,
+    // reject before reading any body bytes.
+    if let Some(len) = resp.content_length() {
+        if len as usize > max_bytes {
+            return Err(VisionError::Analysis(format!(
+                "server response too large: Content-Length {} bytes (limit {} MiB)",
+                len,
+                max_bytes / 1024 / 1024
+            )));
+        }
+    }
+
+    let mut body = Vec::with_capacity(4096);
+    let mut resp = resp;
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| VisionError::Analysis(format!("server read body: {e}")))?
+    {
+        if body.len() + chunk.len() > max_bytes {
+            return Err(VisionError::Analysis(format!(
+                "server response too large: exceeded {} MiB limit",
+                max_bytes / 1024 / 1024
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body)
+        .map_err(|e| VisionError::Analysis(format!("server response not valid UTF-8: {e}")))
 }
 
 #[cfg(test)]

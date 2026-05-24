@@ -31,6 +31,12 @@ pub enum VisionError {
 
     #[error("daemon: {0}")]
     Daemon(String),
+
+    #[error("payload too large: {0} bytes (limit {1} bytes)")]
+    PayloadTooLarge(usize, usize),
+
+    #[error("image too large: {0} bytes (limit {1} bytes)")]
+    ImageTooLarge(u64, u64),
 }
 
 impl VisionError {
