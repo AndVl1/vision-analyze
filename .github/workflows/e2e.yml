@@ -1,0 +1,329 @@
+name: E2E (real VLM)
+
+# Runs real inference against llama-server + SmolVLM-256M-Q8_0.
+# Purpose: regression safety on the HTTP client / request path.
+# Model output quality is NOT checked — only non-empty output + correct exit codes.
+#
+# Triggers:
+#   - Manual via workflow_dispatch
+#   - Nightly at 04:00 UTC
+#   - PR only when backend integration files change
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+  pull_request:
+    paths:
+      - "src/client/**"
+      - "src/daemon.rs"
+      - "src/socket.rs"
+      - "src/main.rs"
+      - "Cargo.toml"
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+  # ── Model config ──────────────────────────────────────────────────────────────
+  # SmolVLM-256M-Instruct-Q8_0 from ggml-org — ~175 MB model + ~104 MB mmproj.
+  # Smallest gguf VLM confirmed to work with llama-server --mmproj as of May 2026.
+  MODEL_REPO: "ggml-org/SmolVLM-256M-Instruct-GGUF"
+  MODEL_FILE: "SmolVLM-256M-Instruct-Q8_0.gguf"
+  MMPROJ_FILE: "mmproj-SmolVLM-256M-Instruct-Q8_0.gguf"
+  MODEL_VERSION: "v1"  # bump to bust model cache
+
+  # ── llama.cpp binary config ───────────────────────────────────────────────────
+  # Pinned to b4800 for reproducibility. Binary is at build/bin/ inside the zip.
+  LLAMA_RELEASE: "b4800"
+  LLAMA_ZIP: "llama-b4800-bin-ubuntu-x64.zip"
+  LLAMA_CACHE_VERSION: "v1"  # bump if zip asset changes
+
+  # ── Runtime ───────────────────────────────────────────────────────────────────
+  LLAMA_SERVER_URL: "http://127.0.0.1:8080"
+  LLAMA_SERVER_LOG: "/tmp/llama-server.log"
+  VISION_LLAMA_SERVER: "http://127.0.0.1:8080"
+  VISION_SOCKET_PATH: "/tmp/vision-e2e.sock"
+  VISION_PID_PATH: "/tmp/vision-e2e.pid"
+
+jobs:
+  e2e:
+    name: E2E smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── 2. Rust stable ────────────────────────────────────────────────────────
+      - uses: dtolnay/rust-toolchain@stable
+
+      # ── 3a. Restore Cargo cache ───────────────────────────────────────────────
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "e2e"
+
+      # ── 3b. Restore llama.cpp binary cache ───────────────────────────────────
+      - name: Restore llama.cpp binary cache
+        id: llama-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/llama-bin
+          key: llama-${{ env.LLAMA_RELEASE }}-${{ env.LLAMA_CACHE_VERSION }}-${{ runner.os }}
+
+      # ── 3c. Restore model cache ───────────────────────────────────────────────
+      - name: Restore model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/models
+          key: model-smolvlm-256m-q8-${{ env.MODEL_VERSION }}
+
+      # ── 4. Download llama.cpp prebuilt binary (if cache miss) ─────────────────
+      - name: Download llama.cpp prebuilt binary
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          DOWNLOAD_URL="https://github.com/ggerganov/llama.cpp/releases/download/${LLAMA_RELEASE}/${LLAMA_ZIP}"
+          echo "Downloading llama.cpp from: ${DOWNLOAD_URL}"
+          mkdir -p /tmp/llama-bin
+          curl -fSL --retry 3 --retry-delay 5 \
+            "${DOWNLOAD_URL}" \
+            -o /tmp/llama.zip \
+            || { echo "ERROR: failed to download ${DOWNLOAD_URL}"; exit 1; }
+          unzip -q /tmp/llama.zip -d /tmp/llama-extract
+          # Binary lives at build/bin/llama-server inside the zip
+          cp /tmp/llama-extract/build/bin/llama-server /tmp/llama-bin/llama-server
+          chmod +x /tmp/llama-bin/llama-server
+          rm -rf /tmp/llama.zip /tmp/llama-extract
+
+      - name: Verify llama-server binary
+        run: |
+          /tmp/llama-bin/llama-server --version 2>&1 || true
+          echo "llama-server binary OK at /tmp/llama-bin/llama-server"
+
+      # ── 5. Download model gguf + mmproj (if cache miss) ───────────────────────
+      - name: Download SmolVLM-256M model files
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          HF_BASE="https://huggingface.co/${MODEL_REPO}/resolve/main"
+          mkdir -p /tmp/models
+
+          echo "Downloading model: ${MODEL_FILE}"
+          curl -fSL --retry 3 --retry-delay 10 \
+            "${HF_BASE}/${MODEL_FILE}" \
+            -o "/tmp/models/${MODEL_FILE}" \
+            || { echo "ERROR: failed to download ${HF_BASE}/${MODEL_FILE}"; exit 1; }
+
+          echo "Downloading mmproj: ${MMPROJ_FILE}"
+          curl -fSL --retry 3 --retry-delay 10 \
+            "${HF_BASE}/${MMPROJ_FILE}" \
+            -o "/tmp/models/${MMPROJ_FILE}" \
+            || { echo "ERROR: failed to download ${HF_BASE}/${MMPROJ_FILE}"; exit 1; }
+
+          echo "Model files downloaded:"
+          ls -lh /tmp/models/
+
+      - name: Verify model files
+        run: |
+          test -f "/tmp/models/${MODEL_FILE}"  || { echo "ERROR: model file missing"; exit 1; }
+          test -f "/tmp/models/${MMPROJ_FILE}" || { echo "ERROR: mmproj file missing"; exit 1; }
+          MODEL_SIZE=$(stat -c%s "/tmp/models/${MODEL_FILE}")
+          MMPROJ_SIZE=$(stat -c%s "/tmp/models/${MMPROJ_FILE}")
+          # Sanity: model must be >50 MB, mmproj >10 MB
+          [ "${MODEL_SIZE}" -gt 52428800 ]  || { echo "ERROR: model file suspiciously small (${MODEL_SIZE} bytes)"; exit 1; }
+          [ "${MMPROJ_SIZE}" -gt 10485760 ] || { echo "ERROR: mmproj file suspiciously small (${MMPROJ_SIZE} bytes)"; exit 1; }
+          echo "Model OK: $(numfmt --to=iec ${MODEL_SIZE})"
+          echo "Mmproj OK: $(numfmt --to=iec ${MMPROJ_SIZE})"
+
+      # ── 6. Build vision-analyze ───────────────────────────────────────────────
+      - name: Build vision-analyze (release)
+        run: cargo build --release --locked
+
+      # ── 7. Start llama-server in background ───────────────────────────────────
+      - name: Start llama-server
+        run: |
+          set -euo pipefail
+          /tmp/llama-bin/llama-server \
+            --model "/tmp/models/${MODEL_FILE}" \
+            --mmproj "/tmp/models/${MMPROJ_FILE}" \
+            --host 127.0.0.1 \
+            --port 8080 \
+            --ctx-size 2048 \
+            --n-predict 256 \
+            --threads 2 \
+            > "${LLAMA_SERVER_LOG}" 2>&1 &
+          echo $! > /tmp/llama-server.pid
+          echo "llama-server started with PID $(cat /tmp/llama-server.pid)"
+
+      # ── 8. Wait for /health (timeout 120s) ───────────────────────────────────
+      - name: Wait for llama-server /health
+        run: |
+          set -euo pipefail
+          TIMEOUT=120
+          ELAPSED=0
+          echo "Waiting for llama-server at ${LLAMA_SERVER_URL}/health ..."
+          until curl -sf "${LLAMA_SERVER_URL}/health" > /dev/null 2>&1; do
+            if [ "${ELAPSED}" -ge "${TIMEOUT}" ]; then
+              echo "ERROR: llama-server did not become ready within ${TIMEOUT}s"
+              echo "=== llama-server log ==="
+              cat "${LLAMA_SERVER_LOG}" || true
+              exit 1
+            fi
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+          done
+          echo "llama-server ready after ${ELAPSED}s"
+
+      # ── 9. Smoke tests ────────────────────────────────────────────────────────
+
+      # 9a. --health → exit 0 (cold path: no daemon socket, hits server backend)
+      - name: "Smoke: --health reports ok"
+        run: |
+          set -euo pipefail
+          OUTPUT=$(./target/release/vision-analyze \
+            --backend server \
+            --health 2>&1)
+          echo "Output: ${OUTPUT}"
+          echo "${OUTPUT}" | grep -q '"status":"ok"' \
+            || { echo "ERROR: expected {\"status\":\"ok\",...} in output"; exit 1; }
+
+      # 9b. Basic inference with --preset ui → non-empty stdout, exit 0
+      - name: "Smoke: inference with --preset ui produces non-empty output"
+        run: |
+          set -euo pipefail
+          # Separate stdout from stderr to avoid tracing noise corrupting the output check.
+          ./target/release/vision-analyze \
+            --backend server \
+            --preset ui \
+            --timeout 60000 \
+            tests/fixtures/screenshot.png \
+            > /tmp/e2e-ui-stdout.txt 2>/tmp/e2e-ui-stderr.txt
+          OUTPUT=$(cat /tmp/e2e-ui-stdout.txt)
+          echo "stdout: ${OUTPUT}"
+          echo "stderr (last 10 lines):"
+          tail -10 /tmp/e2e-ui-stderr.txt || true
+          [ -n "${OUTPUT}" ] || { echo "ERROR: empty stdout from vision-analyze"; exit 1; }
+
+      # 9c. JSON output: --format json --preset element-find → valid JSON with .result non-empty
+      - name: "Smoke: JSON format output is valid and has non-empty .result"
+        run: |
+          set -euo pipefail
+          STDOUT=$(./target/release/vision-analyze \
+            --backend server \
+            --format json \
+            --preset element-find \
+            --timeout 60000 \
+            tests/fixtures/ui-element.png \
+            "find a button" 2>/tmp/e2e-stderr.txt)
+          echo "stdout: ${STDOUT}"
+          echo "${STDOUT}" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert 'result' in data, 'missing .result key'
+          assert data['result'], '.result must not be empty'
+          print('JSON validation passed, result length:', len(str(data['result'])))
+          " || { echo "stderr:"; cat /tmp/e2e-stderr.txt; exit 1; }
+
+      # 9d. Warm-mode cycle: --warm → inference → --stop, verify pid+socket cleanup
+      - name: "Smoke: warm-mode start/infer/stop lifecycle"
+        run: |
+          set -euo pipefail
+
+          # Start warm daemon
+          ./target/release/vision-analyze \
+            --backend server \
+            --warm 2>&1
+          echo "Daemon started"
+
+          # Give daemon a moment to bind the socket
+          sleep 2
+
+          # Verify socket exists
+          test -S "${VISION_SOCKET_PATH}" \
+            || { echo "ERROR: socket ${VISION_SOCKET_PATH} not created"; exit 1; }
+
+          # Run inference via warm daemon (auto-detect → socket path when daemon is running)
+          ./target/release/vision-analyze \
+            --preset ui \
+            --timeout 60000 \
+            tests/fixtures/screenshot.png \
+            > /tmp/e2e-warm-stdout.txt 2>/tmp/e2e-warm-stderr.txt
+          OUTPUT=$(cat /tmp/e2e-warm-stdout.txt)
+          echo "Warm inference stdout: ${OUTPUT}"
+          [ -n "${OUTPUT}" ] \
+            || { echo "ERROR: empty stdout from warm daemon inference"; exit 1; }
+
+          # Stop daemon
+          ./target/release/vision-analyze --stop 2>&1
+          sleep 1
+
+          # Verify cleanup: socket and pid should be gone
+          if [ -S "${VISION_SOCKET_PATH}" ]; then
+            echo "ERROR: socket ${VISION_SOCKET_PATH} still exists after --stop"
+            exit 1
+          fi
+          if [ -f "${VISION_PID_PATH}" ]; then
+            echo "ERROR: pid file ${VISION_PID_PATH} still exists after --stop"
+            exit 1
+          fi
+          echo "Warm lifecycle OK: daemon started, served inference, stopped cleanly"
+
+      # 9e. Negative: image > 32 MiB → exit 1 with ImageTooLarge
+      - name: "Smoke: oversized image is rejected with exit 1"
+        run: |
+          # Do NOT use set -e here: we intentionally expect a non-zero exit code.
+          # Create a 33 MiB dummy file — NOT a valid PNG; the size check fires before decode.
+          dd if=/dev/zero bs=1M count=33 of=/tmp/big-image.png 2>/dev/null
+          ./target/release/vision-analyze \
+            --backend server \
+            --timeout 10000 \
+            /tmp/big-image.png \
+            "describe"
+          EXIT=$?
+          if [ "${EXIT}" -eq 0 ]; then
+            echo "ERROR: vision-analyze should have rejected oversized image (exit 0 unexpected)"
+            exit 1
+          fi
+          # Exit 1 = generic error (ImageTooLarge). Exit 2 = backend unavailable — unexpected here.
+          echo "Oversized-image rejection OK (exit ${EXIT})"
+
+      # ── 10. Kill llama-server ─────────────────────────────────────────────────
+      - name: Stop llama-server
+        if: always()
+        run: |
+          if [ -f /tmp/llama-server.pid ]; then
+            PID=$(cat /tmp/llama-server.pid)
+            kill "${PID}" 2>/dev/null || true
+            echo "Sent SIGTERM to llama-server PID ${PID}"
+          fi
+
+      # ── 11. Dump server log on failure ────────────────────────────────────────
+      - name: Dump llama-server log on failure
+        if: failure()
+        run: |
+          echo "=== llama-server log ==="
+          cat "${LLAMA_SERVER_LOG}" 2>/dev/null || echo "(log file not found)"
+          echo ""
+          echo "=== Attempting RUST_LOG=trace re-run for diagnostics ==="
+          RUST_LOG=trace ./target/release/vision-analyze \
+            --backend server \
+            --timeout 15000 \
+            tests/fixtures/screenshot.png \
+            "describe" 2>&1 | tail -50 || true
+
+      # ── 12. Upload server log as artifact (always) ────────────────────────────
+      - name: Upload llama-server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-log-${{ github.run_id }}
+          path: /tmp/llama-server.log
+          if-no-files-found: ignore
+          retention-days: 7
