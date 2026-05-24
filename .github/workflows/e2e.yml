@@ -99,9 +99,16 @@ jobs:
             -o /tmp/llama.tgz \
             || { echo "ERROR: failed to download ${DOWNLOAD_URL}"; exit 1; }
           tar -xzf /tmp/llama.tgz -C /tmp/llama-extract
-          # Archive layout: build/bin/{llama-server,libllama.so,libggml*.so,...}
-          cp -r /tmp/llama-extract/build/bin/. /tmp/llama-bin/
-          chmod +x /tmp/llama-bin/llama-server
+          # Archive layout: llama-bXXXX/{llama-server,llama-mtmd-cli,libllama.so,libggml*.so,...}
+          # Find the single top-level dir (e.g. llama-b9305) and copy its contents.
+          SRC_DIR=$(find /tmp/llama-extract -mindepth 1 -maxdepth 1 -type d | head -n1)
+          if [ -z "${SRC_DIR}" ]; then
+            echo "ERROR: extracted archive has no top-level dir"
+            ls -la /tmp/llama-extract
+            exit 1
+          fi
+          cp -r "${SRC_DIR}/." /tmp/llama-bin/
+          chmod +x /tmp/llama-bin/llama-server /tmp/llama-bin/llama-mtmd-cli || true
           rm -rf /tmp/llama.tgz /tmp/llama-extract
 
       - name: Verify llama-server binary
