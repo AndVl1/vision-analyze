@@ -4,6 +4,12 @@ All notable changes documented here. Format based on [Keep a Changelog](https://
 
 ## [Unreleased] - ReleaseDate
 
+## [0.1.2](https://github.com/AndVl1/vision-analyze/compare/v0.1.1...v0.1.2) - 2026-05-24
+
+### Added
+
+- add claude-plugin with vision-analyze skill + brew caveats + tap README autogen ([#4](https://github.com/AndVl1/vision-analyze/pull/4))
+
 ## [0.1.1](https://github.com/AndVl1/vision-analyze/compare/v0.1.0...v0.1.1) - 2026-05-24
 
 ### Other
