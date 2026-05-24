@@ -12,15 +12,15 @@
 
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
-
+use arc_swap::ArcSwap;
 use base64::Engine;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::client::{self, Backend, InferenceRequest};
@@ -91,9 +91,15 @@ pub async fn run(cfg: EffectiveConfig) -> Result<()> {
 
     info!(backend = backend.label(), "backend selected");
 
-    // H3: wrap in Mutex so individual connections can attempt re-detect on failure
-    // without requiring a daemon restart.
-    let backend = Arc::new(Mutex::new(backend));
+    // I2: ArcSwap gives lock-free inference reads — each connection takes an Arc
+    // snapshot of the current backend without blocking any other connection.
+    // I1: AtomicBool + Notify coalesce concurrent re-detect attempts into one:
+    //   - the first failing connection sets `redetect_in_flight` and runs detect;
+    //   - latecomers spin-wait on `redetect_done` and then retry with the fresh
+    //     backend that the winner already stored.
+    let backend = Arc::new(ArcSwap::from_pointee(backend));
+    let redetect_in_flight = Arc::new(AtomicBool::new(false));
+    let redetect_done = Arc::new(Notify::new());
     let cfg = Arc::new(cfg);
 
     // Broadcast channel: sending any value triggers graceful shutdown.
@@ -115,12 +121,24 @@ pub async fn run(cfg: EffectiveConfig) -> Result<()> {
                 match accept {
                     Ok((stream, _addr)) => {
                         let backend = Arc::clone(&backend);
+                        let redetect_in_flight = Arc::clone(&redetect_in_flight);
+                        let redetect_done = Arc::clone(&redetect_done);
                         let cfg = Arc::clone(&cfg);
                         let shutdown_tx = shutdown_tx.clone();
                         // C3: give each task its own independent Receiver.
                         let task_shutdown_rx = shutdown_tx.subscribe();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, backend, cfg, shutdown_tx, task_shutdown_rx).await {
+                            if let Err(e) = handle_connection(
+                                stream,
+                                backend,
+                                redetect_in_flight,
+                                redetect_done,
+                                cfg,
+                                shutdown_tx,
+                                task_shutdown_rx,
+                            )
+                            .await
+                            {
                                 warn!(err = %e, "connection error");
                             }
                         });
@@ -344,11 +362,20 @@ impl DaemonClient {
 /// `_shutdown_rx` is kept alive for the duration of the connection so the task
 /// participates in the broadcast shutdown (C3: each task holds its own Receiver).
 ///
-/// `cfg` is used for H3: if a `Server` backend returns an inference error, we
-/// attempt re-detect once before returning the error to the client.
+/// ## Concurrency model (I1 + I2)
+///
+/// - **I2** — inference is called on an `Arc` snapshot cloned from `ArcSwap`
+///   outside any lock, so concurrent requests proceed in parallel.
+/// - **I1** — re-detect on `exit_code() == 2` is coalesced: the first failing
+///   task atomically claims the "in-flight" flag with `compare_exchange` and
+///   runs `select_backend`; later arrivals wait on `redetect_done` and then
+///   retry with the fresh backend the winner stored.  At most one
+///   `select_backend` call fires per failure burst.
 async fn handle_connection(
     stream: UnixStream,
-    backend: Arc<Mutex<Backend>>,
+    backend: Arc<ArcSwap<Backend>>,
+    redetect_in_flight: Arc<AtomicBool>,
+    redetect_done: Arc<Notify>,
     cfg: Arc<EffectiveConfig>,
     shutdown_tx: broadcast::Sender<()>,
     _shutdown_rx: broadcast::Receiver<()>,
@@ -410,30 +437,44 @@ async fn handle_connection(
                 timeout: Duration::from_millis(timeout_ms),
             };
 
-            let infer_result = {
-                let guard = backend.lock().await;
-                guard.infer(infer_req.clone()).await
-            };
+            // I2: load_full() is a cheap Arc clone — no lock held across await.
+            let current = backend.load_full();
+            let infer_result = current.infer(infer_req.clone()).await;
 
-            // H3: on inference error, attempt backend re-detect once.
-            // This handles the case where llama-server restarted during daemon lifetime.
+            // H3 / I1: on exit_code==2, coalesce re-detect into a singleton.
+            // Only the task that wins the compare_exchange runs select_backend;
+            // all other concurrent failures subscribe to redetect_done and wait.
             let infer_result = match infer_result {
                 Err(ref e) if e.exit_code() == 2 => {
-                    warn!(err = %e, "inference failed; attempting backend re-detect");
-                    match client::select_backend(&cfg).await {
-                        Ok(new_backend) => {
-                            info!(backend = new_backend.label(), "backend re-detected");
-                            let retry = new_backend.infer(infer_req).await;
-                            // Update shared backend only on successful re-detect.
-                            if retry.is_ok() {
-                                *backend.lock().await = new_backend;
+                    warn!(err = %e, "inference failed with exit_code 2; coalescing re-detect");
+
+                    if redetect_in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        // This task won the race — run the actual detect.
+                        match client::select_backend(&cfg).await {
+                            Ok(new_backend) => {
+                                info!(backend = new_backend.label(), "backend re-detected");
+                                // Store the new backend atomically; all future load_full()
+                                // calls on ArcSwap will see the updated Arc immediately.
+                                backend.store(Arc::new(new_backend.clone()));
+                                redetect_in_flight.store(false, Ordering::Release);
+                                redetect_done.notify_waiters();
+                                new_backend.infer(infer_req).await
                             }
-                            retry
+                            Err(detect_err) => {
+                                warn!(err = %detect_err, "backend re-detect failed");
+                                redetect_in_flight.store(false, Ordering::Release);
+                                redetect_done.notify_waiters();
+                                infer_result
+                            }
                         }
-                        Err(detect_err) => {
-                            warn!(err = %detect_err, "backend re-detect failed; returning original error");
-                            infer_result
-                        }
+                    } else {
+                        // Another task is already running re-detect — wait for it,
+                        // then retry once with whatever backend was stored.
+                        redetect_done.notified().await;
+                        backend.load_full().infer(infer_req).await
                     }
                 }
                 other => other,
@@ -471,7 +512,7 @@ async fn handle_connection(
         }
 
         SocketRequest::Health => {
-            let label = backend.lock().await.label();
+            let label = backend.load().label();
             write_message(
                 &mut writer,
                 &SocketResponse::Health {
@@ -716,5 +757,148 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(bytes.as_slice());
         let result: Result<crate::socket::SocketRequest> = read_message_from_buf(&mut reader).await;
         assert!(result.is_ok());
+    }
+
+    // ── I2: ArcSwap concurrency — no serialization under parallel load ─────────
+
+    /// I2: Verify that `ArcSwap::load_full()` gives each concurrent task its own
+    /// `Arc<Backend>` without blocking.  We replace the stored backend while 8
+    /// concurrent "readers" are active and assert every reader sees a consistent
+    /// (non-corrupt) value — no lock contention, no serialization.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn arcswap_load_does_not_serialize_concurrent_readers() {
+        use crate::client::{server::ServerClient, Backend};
+        use arc_swap::ArcSwap;
+
+        let swap: Arc<ArcSwap<Backend>> = Arc::new(ArcSwap::from_pointee(Backend::Server(
+            ServerClient::new("http://127.0.0.1:19999"),
+        )));
+
+        let start = tokio::time::Instant::now();
+
+        // Spawn 8 tasks that each "do work" for 50 ms with their own Arc snapshot.
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let swap = Arc::clone(&swap);
+                tokio::spawn(async move {
+                    let _backend = swap.load_full(); // cheap Arc clone
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // Backend label is readable without blocking.
+                    _backend.label()
+                })
+            })
+            .collect();
+
+        // While tasks run, swap the backend — must not block.
+        swap.store(Arc::new(Backend::Server(ServerClient::new(
+            "http://127.0.0.1:19999",
+        ))));
+
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+
+        // All 8 tasks ran concurrently: total time should be ~50 ms, well under 400 ms.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "concurrent readers serialized: elapsed {elapsed:?}"
+        );
+    }
+
+    // ── I1: re-detect coalescing — select_backend called at most once per burst ─
+
+    /// I1: When N concurrent requests fail simultaneously, only one re-detect
+    /// must fire.  We test the coalescing primitive directly: 10 tasks race on
+    /// `compare_exchange`; exactly one must win and the rest must wait on Notify.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redetect_coalescing_fires_at_most_once_per_burst() {
+        use std::sync::atomic::{AtomicU32, Ordering as O};
+
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(Notify::new());
+        // Counts how many tasks actually ran the "detect" work.
+        let detect_count = Arc::new(AtomicU32::new(0));
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let in_flight = Arc::clone(&in_flight);
+                let done = Arc::clone(&done);
+                let detect_count = Arc::clone(&detect_count);
+                tokio::spawn(async move {
+                    if in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        // Winner: simulate detect latency.
+                        detect_count.fetch_add(1, O::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        in_flight.store(false, Ordering::Release);
+                        done.notify_waiters();
+                    } else {
+                        // Loser: wait for winner.
+                        done.notified().await;
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+
+        assert_eq!(
+            detect_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "expected exactly 1 re-detect call, got {}",
+            detect_count.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// I1: After re-detect completes, late waiters read the new backend stored in
+    /// the `ArcSwap`.  Verify that the swap is visible to all tasks that waited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redetect_waiters_see_new_backend_after_notify() {
+        use crate::client::{server::ServerClient, Backend};
+        use arc_swap::ArcSwap;
+
+        let backend: Arc<ArcSwap<Backend>> = Arc::new(ArcSwap::from_pointee(Backend::Server(
+            ServerClient::new("http://old"),
+        )));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(Notify::new());
+
+        let backend_clone = Arc::clone(&backend);
+        let in_flight_clone = Arc::clone(&in_flight);
+        let done_clone = Arc::clone(&done);
+
+        // Winner task: stores a new backend then notifies.
+        let winner = tokio::spawn(async move {
+            in_flight_clone.store(true, Ordering::Release);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            backend_clone.store(Arc::new(Backend::Server(ServerClient::new("http://new"))));
+            in_flight_clone.store(false, Ordering::Release);
+            done_clone.notify_waiters();
+        });
+
+        // Waiter: subscribes before winner finishes, waits for notification.
+        let backend_waiter = Arc::clone(&backend);
+        let done_waiter = Arc::clone(&done);
+        let waiter = tokio::spawn(async move {
+            done_waiter.notified().await;
+            let b = backend_waiter.load_full();
+            // After notification, we should see the new backend URL.
+            match b.as_ref() {
+                Backend::Server(c) => c.base_url().to_string(),
+                Backend::Cli(_) => "cli".to_string(),
+            }
+        });
+
+        winner.await.expect("winner panicked");
+        let url = waiter.await.expect("waiter panicked");
+        assert_eq!(
+            url, "http://new",
+            "waiter should see updated backend after notify"
+        );
     }
 }

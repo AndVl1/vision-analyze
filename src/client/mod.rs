@@ -31,6 +31,13 @@ pub struct InferenceResponse {
 }
 
 /// Resolved backend ready to execute inference.
+///
+/// Both variants are cheap to clone: `ServerClient` wraps an `Arc`-backed
+/// `reqwest::Client`; `CliClient` wraps `PathBuf` fields.  The `Clone` impl
+/// is required by the `ArcSwap`-based concurrency model in `daemon.rs`
+/// (I2 fix): inference takes an `Arc` snapshot of the current backend
+/// without holding any lock across the await point.
+#[derive(Clone)]
 pub enum Backend {
     Server(server::ServerClient),
     Cli(cli::CliClient),
