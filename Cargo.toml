@@ -1,6 +1,6 @@
 [package]
 name = "vision-analyze"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "CLI for visual screenshot analysis via llama.cpp — local vision LLM fallback for UI automation"
 license = "MIT"
