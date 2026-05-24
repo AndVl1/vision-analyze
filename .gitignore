@@ -9,3 +9,4 @@ Cargo.lock.bak
 swarm-report/
 *.gguf
 /tmp/
+.claude/
