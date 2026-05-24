@@ -20,6 +20,8 @@ on:
       - "src/socket.rs"
       - "src/main.rs"
       - "Cargo.toml"
+      - ".github/workflows/e2e.yml"
+      - "tests/fixtures/**"
 
 concurrency:
   group: e2e-${{ github.ref }}
