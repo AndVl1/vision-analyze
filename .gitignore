@@ -5,6 +5,7 @@ Cargo.lock.bak
 .idea/
 .vscode/
 .work-state/
+.local/
 swarm-report/
 *.gguf
 /tmp/
