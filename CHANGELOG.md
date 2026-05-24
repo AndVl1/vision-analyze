@@ -4,6 +4,13 @@ All notable changes documented here. Format based on [Keep a Changelog](https://
 
 ## [Unreleased] - ReleaseDate
 
+## [0.1.1](https://github.com/AndVl1/vision-analyze/compare/v0.1.0...v0.1.1) - 2026-05-24
+
+### Other
+
+- add E2E workflow with real VLM inference (SmolVLM-256M) ([#3](https://github.com/AndVl1/vision-analyze/pull/3))
+- release v0.1.0
+
 ## [0.1.0](https://github.com/AndVl1/vision-analyze/releases/tag/v0.1.0) - 2026-05-24
 
 ### Added
