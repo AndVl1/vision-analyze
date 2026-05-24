@@ -181,6 +181,19 @@ jobs:
 
             def install
               bin.install "vision-analyze"
+              (pkgshare/"presets").install Dir["presets/*"] if Dir.exist?("presets")
+            end
+
+            def caveats
+              <<~EOS
+                vision-analyze needs a llama.cpp backend at runtime:
+                  brew install llama.cpp
+                  llama-server -hf ggml-org/SmolVLM-256M-Instruct-GGUF -c 2048 --port 8080
+
+                Optional: Claude Code plugin with skill describing usage.
+                  /plugin marketplace add AndVl1/claude-plugin
+                  /plugin install vision-analyze@andvl1-plugins
+              EOS
             end
 
             test do
@@ -210,4 +223,51 @@ jobs:
             gh api -X PUT repos/AndVl1/homebrew-tap/contents/Formula/vision-analyze.rb \
               -f message="vision-analyze ${{ steps.version.outputs.version }}" \
               -f content="$CONTENT"
+          fi
+
+      - name: Regenerate tap README
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Fetch all formulas, extract `desc` from each, regenerate README table.
+          WORK=$(mktemp -d)
+          gh api repos/AndVl1/homebrew-tap/contents/Formula --jq '.[].name' > "$WORK/list"
+          {
+            echo "# homebrew-tap"
+            echo
+            echo "Homebrew tap for AndVl1's CLI tools."
+            echo
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo 'brew tap AndVl1/tap'
+            while read -r f; do
+              name="${f%.rb}"
+              echo "brew install ${name}"
+            done < "$WORK/list"
+            echo '```'
+            echo
+            echo "## Tools"
+            echo
+            echo "| Formula | Description |"
+            echo "|---------|-------------|"
+            while read -r f; do
+              name="${f%.rb}"
+              body=$(gh api "repos/AndVl1/homebrew-tap/contents/Formula/${f}" --jq '.content' | base64 -d)
+              desc=$(echo "$body" | grep -E '^\s*desc\s+' | head -1 | sed -E 's/^\s*desc\s+"(.*)"\s*$/\1/')
+              echo "| \`${name}\` | ${desc} |"
+            done < "$WORK/list"
+          } > "$WORK/README.md"
+
+          NEW=$(base64 -w 0 "$WORK/README.md")
+          OLD_SHA=$(gh api repos/AndVl1/homebrew-tap/contents/README.md --jq '.sha')
+          OLD_CONTENT=$(gh api repos/AndVl1/homebrew-tap/contents/README.md --jq '.content' | base64 -d)
+          if [ "$(cat "$WORK/README.md")" = "$OLD_CONTENT" ]; then
+            echo "README already up to date"
+          else
+            gh api -X PUT repos/AndVl1/homebrew-tap/contents/README.md \
+              -f message="readme: refresh tool list after vision-analyze ${{ steps.version.outputs.version }}" \
+              -f content="$NEW" \
+              -f sha="$OLD_SHA"
           fi

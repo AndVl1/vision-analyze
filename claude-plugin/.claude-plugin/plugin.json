@@ -1,0 +1,8 @@
+{
+  "name": "vision-analyze",
+  "version": "0.1.0",
+  "description": "Skill for using vision-analyze CLI — visual screenshot analysis via llama.cpp (Qwen2-VL, SmolVLM, etc).",
+  "author": {
+    "name": "AndVl1"
+  }
+}
