@@ -288,9 +288,10 @@ jobs:
 
       # 9e. Negative: image > 32 MiB → exit 1 with ImageTooLarge
       - name: "Smoke: oversized image is rejected with exit 1"
+        shell: bash
         run: |
-          # Do NOT use set -e here: we intentionally expect a non-zero exit code.
-          # Create a 33 MiB dummy file — NOT a valid PNG; the size check fires before decode.
+          # Explicit bash (no -e): we intentionally expect a non-zero exit code.
+          set +e
           dd if=/dev/zero bs=1M count=33 of=/tmp/big-image.png 2>/dev/null
           ./target/release/vision-analyze \
             --backend server \
@@ -298,6 +299,7 @@ jobs:
             /tmp/big-image.png \
             "describe"
           EXIT=$?
+          set -e
           if [ "${EXIT}" -eq 0 ]; then
             echo "ERROR: vision-analyze should have rejected oversized image (exit 0 unexpected)"
             exit 1
