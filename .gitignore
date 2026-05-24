@@ -1,0 +1,10 @@
+/target
+Cargo.lock.bak
+.DS_Store
+*.swp
+.idea/
+.vscode/
+.work-state/
+swarm-report/
+*.gguf
+/tmp/

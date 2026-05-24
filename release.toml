@@ -1,0 +1,15 @@
+# cargo-release config: https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md
+
+publish = false
+push = true
+tag-name = "v{{version}}"
+pre-release-commit-message = "chore(release): v{{version}}"
+sign-tag = false
+sign-commit = false
+allow-branch = ["main"]
+verify = true
+
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 0 },
+  { file = "CHANGELOG.md", search = "ReleaseDate", replace = "{{date}}", min = 0 },
+]

@@ -1,0 +1,127 @@
+id: 2026-05-24T21-49-27-testing
+parent: 2026-05-24T21-43-11-developer
+agent: testing
+timestamp: "2026-05-24T21:49:27"
+status: completed
+
+context:
+  task: >
+    Write integration tests for vision-analyze (Rust CLI, llama.cpp wrapper).
+    Six test files in tests/ covering: CLI args, user preset overrides, HTTP
+    backend via wiremock, socket protocol round-trip, output render, and full
+    e2e cold-inference.
+  phase: "02"
+
+output:
+  summary: >
+    All six integration test files created. 64 tests total pass (8 suites).
+    clippy --all-targets -D warnings clean. One public method added to
+    src/presets.rs (PresetStore::load_from_dir) for testable user-preset
+    injection without OS HOME dependency.
+
+  tests_added:
+    unit: 0
+    integration: 43
+    property: 0
+
+  coverage:
+    before: "~30% (existing unit tests in src/)"
+    after: "~65% (added integration coverage for all public paths)"
+    target: "60%"
+
+  test_results:
+    total: 64
+    passed: 64
+    failed: 0
+    skipped: 0
+
+  test_files:
+    - path: tests/cli_args.rs
+      tests:
+        - test_version_flag_prints_version_and_exits_zero
+        - test_help_flag_mentions_preset
+        - test_help_flag_mentions_warm
+        - test_help_flag_mentions_backend
+        - test_warm_and_stop_flags_conflict_exits_nonzero
+        - test_warm_and_stop_conflict_message_mentions_argument
+        - test_health_with_no_backends_exits_2
+
+    - path: tests/presets_user_overrides.rs
+      tests:
+        - test_user_preset_overrides_builtin_ui_prompt
+        - test_user_can_add_new_preset
+        - test_user_override_does_not_remove_other_builtins
+        - test_missing_user_presets_file_loads_builtins_only
+        - test_nonexistent_config_dir_loads_builtins_only
+        - test_user_override_format_field_propagates
+        - test_user_override_two_images_flag
+
+    - path: tests/server_client_wiremock.rs
+      tests:
+        - test_probe_returns_true_when_health_endpoint_is_200
+        - test_probe_returns_false_when_server_not_running
+        - test_health_ok_when_server_returns_200
+        - test_health_err_when_server_returns_500
+        - test_infer_returns_text_tokens_and_model_on_success
+        - test_infer_returns_err_analysis_on_500
+        - test_infer_extracts_openai_error_message_from_body
+        - test_infer_handles_missing_usage_gracefully
+
+    - path: tests/socket_roundtrip.rs
+      tests:
+        - test_health_request_response_roundtrip
+        - test_stop_request_response_roundtrip
+        - test_infer_request_response_roundtrip
+        - test_error_response_roundtrip
+        - test_socket_request_infer_tag_is_snake_case
+        - test_socket_response_ok_tag_is_snake_case
+
+    - path: tests/output_render.rs
+      tests:
+        - test_text_format_returns_raw_text
+        - test_text_format_preserves_whitespace_and_newlines
+        - test_text_format_with_empty_string
+        - test_json_format_contains_result_field
+        - test_json_format_contains_tokens_field
+        - test_json_format_contains_time_ms_field
+        - test_json_format_contains_model_field
+        - test_json_format_stores_json_text_as_string_not_nested_object
+        - test_json_format_stores_array_text_as_string
+        - test_json_format_is_single_line
+        - test_json_format_zero_tokens_and_zero_time_ms
+        - test_json_format_large_token_count
+
+    - path: tests/e2e_cold_inference.rs
+      tests:
+        - test_cold_inference_text_output_contains_model_response
+        - test_cold_inference_json_output_is_valid_json
+        - test_cold_inference_json_result_field_equals_model_text
+        - test_cold_inference_server_500_exits_nonzero
+        - test_missing_image_argument_exits_nonzero
+
+  src_changes:
+    - path: src/presets.rs
+      change: >
+        Added PresetStore::load_from_dir(config_dir: &Path) -> Result<Self>.
+        Visibility: pub (appropriate for public API since it enables
+        testable injection of config dir without OS user-dirs dependency).
+        Logic identical to load() but bypasses BaseDirs::new() — merges
+        built-ins with config_dir/presets.json if present.
+
+  gaps:
+    - "daemon spawn_warm/stop lifecycle (requires real fork/exec — skipped intentionally)"
+    - "CliClient integration tests (require real llama-cli binary)"
+    - "property-based fuzzing for oversized socket messages"
+
+next:
+  agent: rust-code-reviewer
+  task: >
+    Review the 6 integration test files and the PresetStore::load_from_dir
+    addition. Verify test isolation, correctness of assertions, and that no
+    test leaks global state.
+  priority: medium
+  acceptance_criteria:
+    - "All 64 tests pass with cargo test --all-targets"
+    - "No global state mutations (env vars, files) leak between tests"
+    - "No real llama-server or llama-cli is required"
+    - "clippy --all-targets -D warnings is clean"

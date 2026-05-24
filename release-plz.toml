@@ -1,0 +1,17 @@
+# release-plz config — opens version-bump PR per push to main, creates the
+# vX.Y.Z tag when the PR is merged.  The tag triggers cd.yml which does the
+# actual binary builds, GH release upload, Homebrew update.
+
+[workspace]
+# vision-analyze is a binary CLI. Two settings are needed to fully detach from crates.io:
+#   - `publish = false`     — skip `cargo publish` on release
+#   - `git_only = true`     — read the previous release from git tags, not
+#                             from crates.io
+# Only the combination `git_only = true && publish = true` is rejected; the
+# pair below is allowed and is what binary-only crates need.
+publish = false
+git_only = true
+# cd.yml owns GH release creation (it has the built artifacts to upload).
+git_release_enable = false
+# Binary crate — semver check is for libraries.
+semver_check = false

@@ -1,0 +1,161 @@
+id: 2026-05-24T21-43-11-developer
+parent: null
+agent: developer
+timestamp: "2026-05-24T21:43:11"
+status: completed
+
+context:
+  task: >
+    Implement remaining modules for vision-analyze CLI:
+    src/lib.rs, src/socket.rs, src/output.rs, src/daemon.rs, src/main.rs.
+    Warm-daemon mode with Unix socket IPC, cold/warm inference dispatch,
+    graceful shutdown via SIGTERM/SIGINT/Stop request.
+  phase: "01"
+
+output:
+  summary: >
+    All five modules implemented from scratch. cargo check and cargo clippy
+    -D warnings pass with zero errors/warnings. cargo fmt applied.
+    One dependency addition (tempfile promoted from dev to main).
+
+  files_changed:
+    - path: src/lib.rs
+      action: created
+      changes: "Public module tree: cli, client, config, daemon, error, output, presets, socket"
+
+    - path: src/socket.rs
+      action: created
+      changes: >
+        Line-delimited JSON protocol. SocketRequest (Infer/Health/Stop) and
+        SocketResponse (Ok/Health/Stopped/Error) with serde tag. Generic
+        read_message / write_message helpers over AsyncRead/AsyncWrite.
+        Line limit 64 MiB. Full roundtrip tests.
+
+    - path: src/output.rs
+      action: created
+      changes: >
+        render() function: Text -> raw text, Json -> serde_json object with
+        result/tokens/time_ms/model. Doc-tested, unit-tested.
+
+    - path: src/daemon.rs
+      action: created
+      changes: >
+        run(): bind UnixListener, chmod 0o600, atomic PID write, Arc<Backend>
+        shared across tasks, tokio::select! on accept/SIGTERM/SIGINT/Stop broadcast.
+        spawn_warm(): std::process::Command + pre_exec(setsid) for detach,
+        socket polling up to 5s. stop(): graceful Stop request, fallback SIGTERM
+        then SIGKILL, unconditional file cleanup.
+        try_client(): 50 ms connect timeout.
+        DaemonClient::send(): split stream, write then read.
+
+    - path: src/main.rs
+      action: created
+      changes: >
+        Entry point. tokio multi-thread 2 workers. dispatch() routes daemon_internal /
+        warm / stop / health / inference. health_check() tries warm socket first,
+        falls back to cold backend probe. inference() resolves preset/prompt/format,
+        reads image bytes, tries warm socket, falls back to cold backend.
+        init_tracing() maps -v/-vv/-vvv to info/debug/trace, respects RUST_LOG.
+
+    - path: Cargo.toml
+      action: modified
+      changes: "Moved tempfile from dev-dependencies to main dependencies (needed by cli.rs in production code)"
+
+    - path: src/client/cli.rs
+      action: modified
+      changes: "Removed unused Duration import (clippy -D warnings fix)"
+
+    - path: src/client/server.rs
+      action: modified
+      changes: "Removed unused json import from serde_json (clippy -D warnings fix)"
+
+    - path: src/client/detect.rs
+      action: modified
+      changes: "Replaced or_else(|_| Err(...)) with map_err(|_| ...) as required by clippy"
+
+    - path: src/config.rs
+      action: modified
+      changes: "infer_mmproj_path parameter changed from &PathBuf to &Path (clippy prefer-path-over-pathbuf)"
+
+  types_implemented:
+    - name: SocketRequest
+      location: src/socket.rs
+      tests: true
+    - name: SocketResponse
+      location: src/socket.rs
+      tests: true
+    - name: DaemonClient
+      location: src/daemon.rs
+      tests: false
+    - name: "render (fn)"
+      location: src/output.rs
+      tests: true
+
+  dependencies_added:
+    - name: tempfile
+      version: "3"
+      features: []
+      reason: >
+        Already in dev-dependencies; promoted to main because cli.rs (production
+        inference path) uses tempfile::tempdir() for image staging.
+
+  key_decisions:
+    - topic: daemon fork / detach
+      decision: >
+        Used std::process::Command (not tokio::process::Command) with
+        pre_exec(setsid) so the child becomes a session leader before exec.
+        Stdin/stdout/stderr set to Stdio::null(). The parent does NOT await the
+        child — it polls the Unix socket for up to 5 s to confirm readiness.
+      rationale: >
+        tokio::process::Command does not expose pre_exec on stable Rust.
+        std::process::Command::pre_exec is stable via std::os::unix::process::CommandExt.
+
+    - topic: socket cleanup on shutdown
+      decision: >
+        cleanup() called in run() after the accept-loop exits (whether due to
+        signal or Stop request). cleanup() is intentionally infallible —
+        remove_file errors are logged at debug level and ignored so shutdown
+        always completes cleanly even if files were already removed.
+      rationale: >
+        The daemon must not hang on shutdown due to cleanup errors.
+        Files may already be absent if stop() was called concurrently.
+
+    - topic: stale-socket detection
+      decision: >
+        maybe_remove_stale_socket() reads the PID file and does kill(pid, 0)
+        before removing the socket. Returns Err if the process is alive.
+      rationale: >
+        Prevents two daemons binding to the same socket path, which would cause
+        the second one to silently take over connections.
+
+    - topic: warm fallback to cold
+      decision: >
+        In inference(), if the warm daemon responds with SocketResponse::Error,
+        the CLI falls through to the cold path transparently. Any other
+        unexpected response also falls through.
+      rationale: >
+        Resilience — a transient daemon error should not hard-fail the user's
+        inference call.
+
+    - topic: broadcast channel for shutdown
+      decision: >
+        Uses tokio::sync::broadcast::Sender<()> to coordinate shutdown between
+        the accept-loop and per-connection handlers. A Stop request from any
+        client triggers the broadcast.
+      rationale: >
+        Simple and avoids a Mutex<bool>. Capacity of 1 is sufficient because
+        only one Stop is ever needed.
+
+  todos: []
+
+next:
+  agent: rust-testing-engineer
+  task: >
+    Add integration tests for daemon lifecycle (spawn_warm / try_client /
+    stop) using tempfile sockets. Add socket protocol fuzzing for oversized
+    messages. Verify cold-fallback path in main.rs inference().
+  priority: medium
+  acceptance_criteria:
+    - "daemon start/stop cycle test with real Unix socket"
+    - "SocketRequest/SocketResponse serde round-trip property test"
+    - "inference cold path covered by an integration test with wiremock"

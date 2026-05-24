@@ -1,0 +1,213 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - run: cargo build --release --target ${{ matrix.target }} --locked
+      - name: Package (tar.gz)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          NAME="vision-analyze-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/vision-analyze" "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/" 2>/dev/null || true
+          cp -r presets "dist/${NAME}/" 2>/dev/null || true
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+        env:
+          TAG: ${{ inputs.tag }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Compute combined checksums
+        run: (cd dist && sha256sum *.tar.gz > checksums.txt)
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/checksums.txt
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew formula
+    needs: release
+    if: ${{ !inputs.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          TAG="${{ inputs.tag }}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Download checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ steps.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern checksums.txt
+      - name: Parse checksums
+        id: sha
+        run: |
+          set -euo pipefail
+          v="${{ steps.version.outputs.version }}"
+          for arch in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            sum=$(grep "vision-analyze-${v}-${arch}.tar.gz" checksums.txt | awk '{print $1}')
+            key=$(echo "$arch" | tr -- '-' _)
+            echo "${key}=${sum}" >> "$GITHUB_OUTPUT"
+          done
+      - name: Generate formula
+        run: |
+          cat > vision-analyze.rb <<'FORMULA'
+          class VisionAnalyze < Formula
+            desc "CLI for visual screenshot analysis via llama.cpp"
+            homepage "https://github.com/AndVl1/vision-analyze"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            # Requires llama.cpp with a vision-capable model at runtime.
+            # See https://github.com/AndVl1/vision-analyze#setup for details.
+
+            on_macos do
+              on_arm do
+                url "https://github.com/AndVl1/vision-analyze/releases/download/TAG_PLACEHOLDER/vision-analyze-VERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_MAC_ARM_PLACEHOLDER"
+              end
+              on_intel do
+                url "https://github.com/AndVl1/vision-analyze/releases/download/TAG_PLACEHOLDER/vision-analyze-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_MAC_INTEL_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/AndVl1/vision-analyze/releases/download/TAG_PLACEHOLDER/vision-analyze-VERSION_PLACEHOLDER-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_ARM_PLACEHOLDER"
+              end
+              on_intel do
+                url "https://github.com/AndVl1/vision-analyze/releases/download/TAG_PLACEHOLDER/vision-analyze-VERSION_PLACEHOLDER-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_INTEL_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "vision-analyze"
+            end
+
+            test do
+              assert_match "vision-analyze", shell_output("#{bin}/vision-analyze --version")
+            end
+          end
+          FORMULA
+          sed -i "s/VERSION_PLACEHOLDER/${{ steps.version.outputs.version }}/g" vision-analyze.rb
+          sed -i "s/TAG_PLACEHOLDER/${{ steps.version.outputs.tag }}/g" vision-analyze.rb
+          sed -i "s/SHA_MAC_ARM_PLACEHOLDER/${{ steps.sha.outputs.aarch64_apple_darwin }}/g" vision-analyze.rb
+          sed -i "s/SHA_MAC_INTEL_PLACEHOLDER/${{ steps.sha.outputs.x86_64_apple_darwin }}/g" vision-analyze.rb
+          sed -i "s/SHA_LINUX_ARM_PLACEHOLDER/${{ steps.sha.outputs.aarch64_unknown_linux_gnu }}/g" vision-analyze.rb
+          sed -i "s/SHA_LINUX_INTEL_PLACEHOLDER/${{ steps.sha.outputs.x86_64_unknown_linux_gnu }}/g" vision-analyze.rb
+      - name: Push to homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CONTENT=$(base64 -w 0 vision-analyze.rb)
+          SHA=$(gh api repos/AndVl1/homebrew-tap/contents/Formula/vision-analyze.rb --jq '.sha' 2>/dev/null || echo "")
+          if [ -n "$SHA" ]; then
+            gh api -X PUT repos/AndVl1/homebrew-tap/contents/Formula/vision-analyze.rb \
+              -f message="vision-analyze ${{ steps.version.outputs.version }}" \
+              -f content="$CONTENT" \
+              -f sha="$SHA"
+          else
+            gh api -X PUT repos/AndVl1/homebrew-tap/contents/Formula/vision-analyze.rb \
+              -f message="vision-analyze ${{ steps.version.outputs.version }}" \
+              -f content="$CONTENT"
+          fi

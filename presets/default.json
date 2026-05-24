@@ -1,0 +1,27 @@
+{
+  "ui": {
+    "prompt": "Ты смотришь на скриншот мобильного приложения. Перечисли ВИЗУАЛЬНЫЕ элементы которые ты ВИДИШЬ (не предполагаешь): кнопки, текст, иконки, поля ввода, диалоги, снекбары, изображения. Опиши цвета и расположение. Если видишь дефект рендеринга (наложение, отсутствие элемента, не тот цвет, обрезанный текст) — опиши отдельно. Ответ — JSON: {\"elements\": [...], \"visual_defects\": [...], \"overall_status\": \"ok|suspicious|broken\"}",
+    "format": "json",
+    "two_images": false
+  },
+  "ui-compare": {
+    "prompt": "Сравни ДВА скриншота одного экрана (before и after). Найди ВИЗУАЛЬНЫЕ различия: что изменилось, что появилось, что исчезло. Не предполагай — только то что видишь. Ответ — JSON: {\"changed\": [{\"what\": \"...\", \"where\": \"...\", \"before\": \"...\", \"after\": \"...\"}], \"added\": [...], \"removed\": [...], \"identical\": false}",
+    "format": "json",
+    "two_images": true
+  },
+  "error": {
+    "prompt": "На скриншоте приложения найди признаки ошибки: краш-диалог, ANR, пустой экран, сообщение об ошибке, broken layout, некорректные данные. Ответ — JSON: {\"error_found\": false, \"description\": \"...\", \"error_type\": \"crash|anr|layout|data|other\", \"severity\": \"low|medium|high|critical\"}",
+    "format": "json",
+    "two_images": false
+  },
+  "element-find": {
+    "prompt": "На скриншоте (возможно с bounding boxes) найди элемент по описанию из запроса. Верни JSON: {\"found\": false, \"description\": \"...\", \"approximate_center\": {\"x\": 0, \"y\": 0}, \"bounds\": {\"x1\": 0, \"y1\": 0, \"x2\": 0, \"y2\": 0}}",
+    "format": "json",
+    "two_images": false
+  },
+  "scroll-check": {
+    "prompt": "Сравни два скриншота одного экрана ДО и ПОСЛЕ скролла. Определи направление скролла (если было) и прокрутился ли контент. Ответ — JSON: {\"scrolled\": false, \"direction\": \"up|down|left|right|null\", \"new_content_visible\": false, \"reached_end\": false}",
+    "format": "json",
+    "two_images": true
+  }
+}

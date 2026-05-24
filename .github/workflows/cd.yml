@@ -1,0 +1,21 @@
+name: CD
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
