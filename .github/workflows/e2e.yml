@@ -40,10 +40,10 @@ env:
   MODEL_VERSION: "v1"  # bump to bust model cache
 
   # ── llama.cpp binary config ───────────────────────────────────────────────────
-  # Pinned to b4800 for reproducibility. Binary is at build/bin/ inside the zip.
-  LLAMA_RELEASE: "b4800"
-  LLAMA_ZIP: "llama-b4800-bin-ubuntu-x64.zip"
-  LLAMA_CACHE_VERSION: "v1"  # bump if zip asset changes
+  # Pinned for reproducibility. Modern releases use .tar.gz, ship .so libs alongside binary.
+  LLAMA_RELEASE: "b9305"
+  LLAMA_ASSET: "llama-b9305-bin-ubuntu-x64.tar.gz"
+  LLAMA_CACHE_VERSION: "v2"  # bump if asset changes
 
   # ── Runtime ───────────────────────────────────────────────────────────────────
   LLAMA_SERVER_URL: "http://127.0.0.1:8080"
@@ -91,18 +91,18 @@ jobs:
         if: steps.llama-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          DOWNLOAD_URL="https://github.com/ggerganov/llama.cpp/releases/download/${LLAMA_RELEASE}/${LLAMA_ZIP}"
+          DOWNLOAD_URL="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${LLAMA_ASSET}"
           echo "Downloading llama.cpp from: ${DOWNLOAD_URL}"
-          mkdir -p /tmp/llama-bin
+          mkdir -p /tmp/llama-bin /tmp/llama-extract
           curl -fSL --retry 3 --retry-delay 5 \
             "${DOWNLOAD_URL}" \
-            -o /tmp/llama.zip \
+            -o /tmp/llama.tgz \
             || { echo "ERROR: failed to download ${DOWNLOAD_URL}"; exit 1; }
-          unzip -q /tmp/llama.zip -d /tmp/llama-extract
-          # Copy whole bin/ — llama-server depends on libllama.so + libggml*.so
+          tar -xzf /tmp/llama.tgz -C /tmp/llama-extract
+          # Archive layout: build/bin/{llama-server,libllama.so,libggml*.so,...}
           cp -r /tmp/llama-extract/build/bin/. /tmp/llama-bin/
           chmod +x /tmp/llama-bin/llama-server
-          rm -rf /tmp/llama.zip /tmp/llama-extract
+          rm -rf /tmp/llama.tgz /tmp/llama-extract
 
       - name: Verify llama-server binary
         run: |
